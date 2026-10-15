@@ -284,6 +284,7 @@ class HttpTests(unittest.TestCase):
         self.assertIn(b"id=\"join-guide\"", data)
         self.assertIn(b"sudo zerotier-cli join NETWORK_ID", data)
         self.assertIn(b"join-id", data)
+        self.assertIn(b"id=\"join-command\"", data)
 
     def test_healthz_and_head(self):
         code, _, data = self.request("HEAD", "/")
