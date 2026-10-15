@@ -18,7 +18,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-API_ROOT = "http://127.0.0.1:9993"
+API_ROOT = "http://127.0.0.1:9993"  # Default self-hosted local controller
+CONTROLLER_ENV_KEYS = {"ZT_GAME_CONTROLLER_URL", "ZT_GAME_CONTROLLER_TOKEN"}
 ROOM_PREFIX = "game-room:"
 BIND_HOST = "127.0.0.1"  # Never bind the unauthenticated API publicly.
 BIND_PORT = int(os.environ.get("ZT_GAME_PORT", "9394"))
@@ -34,26 +35,90 @@ class ControllerError(Exception):
     pass
 
 
+def controller_env_settings():
+    """Read the root-only .env *credential* without exporting secrets to process env.
+
+    On systemd, LoadCredential supplies a private controller-env file. An
+    explicit path is accepted for local admin commands and unit tests.
+    """
+    path = os.environ.get("ZT_GAME_CONTROLLER_ENV_FILE")
+    if not path:
+        directory = os.environ.get("CREDENTIALS_DIRECTORY")
+        if not directory:
+            return {}
+        path = str(Path(directory) / "controller-env")
+
+    source = Path(path)
+    if not source.is_file():
+        if os.environ.get("ZT_GAME_CONTROLLER_ENV_FILE"):
+            raise RuntimeError("Controller environment file not found")
+        return {}
+
+    settings = {}
+    for line in source.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, separator, raw_value = line.partition("=")
+        name, raw_value = name.strip(), raw_value.strip()
+        if separator != "=" or name not in CONTROLLER_ENV_KEYS or name in settings:
+            raise RuntimeError("Invalid controller.env format; expected unique ZT_GAME_CONTROLLER_* entries")
+        if len(raw_value) >= 2 and raw_value[0] == raw_value[-1] and raw_value[0] in ("'", '"'):
+            raw_value = raw_value[1:-1]
+        settings[name] = raw_value
+    return settings
+
+
 def token_path():
     credentials = os.environ.get("CREDENTIALS_DIRECTORY")
     if credentials:
-        return Path(credentials) / "zerotier-token"
-    # Explicitly provided only for local tests/development.
+        candidate = Path(credentials) / "zerotier-token"
+        if candidate.is_file():
+            return candidate
+    # Legacy/local-development fallback; no token is sent to the browser.
     override = os.environ.get("ZT_GAME_TOKEN_FILE")
     if override:
         return Path(override)
-    raise RuntimeError("Missing systemd credential: zerotier-token")
+    raise RuntimeError("Missing controller token: configure .env or a local ZeroTier credential")
+
+
+def controller_settings():
+    """Return validated (API URL, token); prefer the installed .env credential."""
+    settings = controller_env_settings()
+    url = (settings.get("ZT_GAME_CONTROLLER_URL")
+           or os.environ.get("ZT_GAME_CONTROLLER_URL") or API_ROOT).strip().rstrip("/")
+    parsed = urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("Invalid ZeroTier controller URL port") from exc
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path not in ("", "/") or parsed.query or parsed.fragment
+            or port == 0):
+        raise RuntimeError("Invalid ZeroTier controller URL")
+    if parsed.scheme == "http" and parsed.hostname.lower() not in ("127.0.0.1", "localhost", "::1"):
+        raise RuntimeError("Remote ZeroTier controller URL must use HTTPS")
+
+    token = settings.get("ZT_GAME_CONTROLLER_TOKEN")
+    if token is None:
+        token = os.environ.get("ZT_GAME_CONTROLLER_TOKEN")
+    if not token:
+        if "ZT_GAME_CONTROLLER_TOKEN" in settings:
+            raise RuntimeError("ZT_GAME_CONTROLLER_TOKEN is empty in controller.env")
+        token = token_path().read_text(encoding="utf-8").strip()
+    if not 1 <= len(token) <= 512 or any(ord(ch) < 33 or ord(ch) > 126 for ch in token):
+        raise RuntimeError("Invalid controller token (expected a non-empty single-line value)")
+    return url, token
 
 
 def controller_request(method, endpoint, payload=None):
-    token = token_path().read_text(encoding="utf-8").strip()
-    if not token:
-        raise ControllerError("Empty ZeroTier controller token")
+    api_root, token = controller_settings()
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"X-ZT1-AUTH": token}
     if data is not None:
         headers["Content-Type"] = "application/json"
-    request = Request(API_ROOT + endpoint, data=data, headers=headers, method=method)
+    request = Request(api_root + endpoint, data=data, headers=headers, method=method)
     try:
         with urlopen(request, timeout=8) as response:
             raw = response.read()
@@ -272,7 +337,7 @@ button:disabled{opacity:.5;cursor:wait}.copy{background:#344359;padding:7px 12px
 th,td{padding:14px 12px;border-bottom:1px solid #344359;text-align:left}
 tr:last-child td{border:0}th{font-size:12px;color:#b0bbcc}code{font-size:13px;white-space:nowrap}
 .num{text-align:center}#notice{min-height:32px;color:#a7e4b2}#notice.error{color:#ff9c9c}
-small{color:#a9b6c9}a{color:#8eb8ff}@media(max-width:540px){body{margin:24px auto}form{flex-direction:column}}
+small{color:#a9b6c9}a{color:#8eb8ff}.guide{margin-top:20px;border:1px solid #344359;border-radius:10px}.guide summary{cursor:pointer;padding:15px;font-weight:650}.guide summary:hover{background:#192439}.guide-body{padding:0 17px 15px;line-height:1.65}.guide ol{padding-left:21px}.guide li{margin-bottom:10px}.guide .sub{margin:5px 0 15px}.guide code{overflow-wrap:anywhere;white-space:normal}.guide .selected{display:block;margin-top:5px;color:#a7e4b2}.help-action{margin-left:6px}@media(max-width:540px){body{margin:24px auto}form{flex-direction:column}.help-action{margin:6px 0 0}}
 </style>
 </head>
 <body>
@@ -281,12 +346,27 @@ small{color:#a9b6c9}a{color:#8eb8ff}@media(max-width:540px){body{margin:24px aut
 <form id="roomForm"><input id="name" placeholder="Tên phòng (ví dụ: AOE tối nay)" maxlength="60" required autocomplete="off"><button id="create">Tạo phòng</button></form>
 <div id="notice" role="status" aria-live="polite"></div>
 <div class="wrap"><table><thead><tr><th>Network ID</th><th>Tên phòng</th><th class="num">Online (ước tính)</th><th></th></tr></thead><tbody id="rooms"><tr><td colspan="4">Đang tải...</td></tr></tbody></table></div>
-<p><small>“Online” là ước tính: thiết bị đã join phòng và có lưu lượng đến controller trong __WINDOW_MINUTES__ phút gần đây. Không bảo đảm đang chơi game; một node có thể hoạt động ở mạng ZeroTier khác. Phòng public: bất kỳ ai có Network ID đều có thể tham gia.</small></p>
+<details id="join-guide" class="guide">
+  <summary>Hướng dẫn cài đặt ZeroTier và tham gia phòng</summary>
+  <div class="guide-body">
+    <p class="sub">Bạn cần cài ứng dụng ZeroTier One trên thiết bị trước khi vào phòng. Website chỉ giúp tạo và chia sẻ Network ID.</p>
+    <ol>
+      <li><strong>Cài ZeroTier One:</strong> tải bản cho Windows, macOS, Linux hoặc điện thoại từ <a href="https://www.zerotier.com/download/" target="_blank" rel="noopener noreferrer">trang tải chính thức của ZeroTier</a>.</li>
+      <li><strong>Lấy ID của phòng:</strong> nhấn <b>Copy ID</b> ở phòng muốn vào, hoặc nhấn <b>Cách join</b> để xem hướng dẫn kèm ID. <span class="selected">ID đã chọn: <code id="join-id">Chưa chọn phòng</code></span></li>
+      <li><strong>Tham gia:</strong> trên Windows/macOS, mở biểu tượng ZeroTier ở khay hệ thống/thanh menu → <b>Join New Network</b> → dán ID → <b>Join</b>. Trên Android/iOS, mở ZeroTier, thêm network bằng ID rồi bật kết nối.</li>
+      <li><strong>Linux (Terminal):</strong> chạy <code>sudo zerotier-cli join NETWORK_ID</code>, thay <code>NETWORK_ID</code> bằng ID vừa copy.</li>
+      <li><strong>Kiểm tra:</strong> trạng thái mạng phải là <code>OK</code>; thiết bị sẽ nhận IP <code>10.230.x.x</code>. Các người chơi cần join <em>cùng một Network ID</em> và mở game LAN để tìm thấy nhau.</li>
+    </ol>
+    <p><small>Phòng được tạo ở chế độ <b>public</b> nên không cần quản trị viên duyệt thiết bị. Không chia sẻ Network ID cho người không mong muốn tham gia. Nếu không nhìn thấy game LAN, hãy kiểm tra tường lửa hệ điều hành.</small></p>
+    <p><small>Tham khảo: <a href="https://docs.zerotier.com/quickstart/" target="_blank" rel="noopener noreferrer">Hướng dẫn chính thức</a>.</small></p>
+  </div>
+</details>
+<p><small>“Online” là ước tính: thiết bị đã join phòng và có lưu lượng đến controller trong __WINDOW_MINUTES__ phút gần đây. Không bảo đảm đang chơi game; một node có thể hoạt động ở mạng ZeroTier khác.</small></p>
 <script nonce="__NONCE__">
 const body=document.getElementById('rooms'),notice=document.getElementById('notice'),form=document.getElementById('roomForm'),input=document.getElementById('name'),btn=document.getElementById('create');
 function message(s,err=false){notice.textContent=s;notice.className=err?'error':''}
 function cell(s){const t=document.createElement('td');t.textContent=s;return t}
-async function refresh(){try{const r=await fetch('/api/rooms',{cache:'no-store'}),j=await r.json();if(!r.ok)throw Error(j.error||'Không đọc được danh sách phòng');body.replaceChildren();for(const room of j.rooms){const tr=document.createElement('tr'),id=cell(room.id),name=cell(room.name),count=cell(String(room.online)),actions=document.createElement('td'),copy=document.createElement('button');id.style.whiteSpace='nowrap';count.className='num';copy.className='copy';copy.textContent='Copy ID';copy.onclick=async()=>{try{await navigator.clipboard.writeText(room.id);copy.textContent='Đã copy';setTimeout(()=>copy.textContent='Copy ID',1200)}catch{message('Không copy được; hãy chọn Network ID và copy thủ công.',true)}};actions.append(copy);tr.append(id,name,count,actions);body.append(tr)}if(!j.rooms.length){const tr=document.createElement('tr'),td=cell('Chưa có phòng nào. Hãy tạo phòng đầu tiên.');td.colSpan=4;tr.append(td);body.append(tr)}}catch(e){message(e.message,true)}}
+async function refresh(){try{const r=await fetch('/api/rooms',{cache:'no-store'}),j=await r.json();if(!r.ok)throw Error(j.error||'Không đọc được danh sách phòng');body.replaceChildren();for(const room of j.rooms){const tr=document.createElement('tr'),id=cell(room.id),name=cell(room.name),count=cell(String(room.online)),actions=document.createElement('td'),copy=document.createElement('button'),help=document.createElement('button');id.style.whiteSpace='nowrap';count.className='num';copy.className='copy';copy.textContent='Copy ID';copy.onclick=async()=>{try{await navigator.clipboard.writeText(room.id);copy.textContent='Đã copy';setTimeout(()=>copy.textContent='Copy ID',1200)}catch{message('Không copy được; hãy chọn Network ID và copy thủ công.',true)}};help.className='copy help-action';help.textContent='Cách join';help.onclick=()=>{const guide=document.getElementById('join-guide');document.getElementById('join-id').textContent=room.id;guide.open=true;guide.scrollIntoView({behavior:'smooth',block:'start'})};actions.append(copy,help);tr.append(id,name,count,actions);body.append(tr)}if(!j.rooms.length){const tr=document.createElement('tr'),td=cell('Chưa có phòng nào. Hãy tạo phòng đầu tiên.');td.colSpan=4;tr.append(td);body.append(tr)}}catch(e){message(e.message,true)}}
 form.addEventListener('submit',async e=>{e.preventDefault();btn.disabled=true;message('Đang tạo phòng...');try{const r=await fetch('/api/rooms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:input.value})}),j=await r.json();if(!r.ok)throw Error(j.error||'Không tạo được phòng');input.value='';message('Đã tạo phòng '+j.room.id);await refresh()}catch(e){message(e.message,true)}finally{btn.disabled=false}});
 refresh();setInterval(refresh,10000);
 </script>
@@ -371,9 +451,11 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     if not (1 <= BIND_PORT <= 65535 and 1 <= MAX_ROOMS <= 254 and 1 <= MAX_CREATES_PER_HOUR <= 100 and 1 <= ONLINE_WINDOW_MINUTES <= 60):
         raise SystemExit("Invalid application settings")
-    # Verify credential before accepting requests.
-    if not token_path().read_text(encoding="utf-8").strip():
-        raise SystemExit("ZeroTier token is empty")
+    # Fail fast on configuration errors without showing the secret.
+    try:
+        controller_settings()
+    except (RuntimeError, OSError, ValueError) as exc:
+        raise SystemExit(f"Invalid controller configuration: {exc}") from exc
     server = ThreadingHTTPServer((BIND_HOST, BIND_PORT), Handler)
     print(f"ZT Game Room UI listening on http://{BIND_HOST}:{BIND_PORT}", flush=True)
     server.serve_forever()
