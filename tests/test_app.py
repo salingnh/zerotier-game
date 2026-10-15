@@ -31,16 +31,88 @@ class RoomTests(unittest.TestCase):
             {"id": "7375be7d6e000001", "name": "game-room:AOE", "creationTime": 12},
             {"id": "7375be7d6e000002", "name": "sali-game-lan", "creationTime": 13},
         ]
+        active = {"1111111111"}
         with patch.object(app, "controller_networks", return_value=networks), \
-             patch.object(app, "member_count", return_value=3):
+             patch.object(app, "active_peer_addresses", return_value=active) as peer_call, \
+             patch.object(app, "online_member_count", return_value=1) as counter:
             rooms = app.list_rooms()
         self.assertEqual(len(rooms), 1)
         self.assertEqual(rooms[0]["name"], "AOE")
-        self.assertEqual(rooms[0]["members"], 3)
+        self.assertEqual(rooms[0]["online"], 1)
+        peer_call.assert_called_once_with()
+        counter.assert_called_once_with("7375be7d6e000001", active)
 
-    def test_member_count_counts_registered_not_presence(self):
-        with patch.object(app, "controller_request", return_value={"a": 1, "b": 2}):
-            self.assertEqual(app.member_count("7375be7d6e000001"), 2)
+    def test_no_rooms_skips_global_peer_query(self):
+        with patch.object(app, "controller_networks", return_value=[]), \
+             patch.object(app, "active_peer_addresses") as peer_call:
+            self.assertEqual(app.list_rooms(), [])
+        peer_call.assert_not_called()
+
+    def test_active_peers_require_recent_inbound_traffic_and_active_path(self):
+        now = 1_700_000_000_000
+        fresh = {"active": True, "expired": False, "lastReceive": now - 20_000}
+        peers = [
+            {"address": "1111111111", "role": "LEAF", "paths": [fresh]},
+            {"address": "1111111111", "role": "LEAF", "paths": [fresh]},  # deduplicate
+            {"address": "2222222222", "role": "LEAF", "paths": [
+                {"active": False, "expired": True, "lastReceive": now - 1000}]},
+            {"address": "3333333333", "role": "LEAF", "paths": [
+                {"active": True, "expired": False,
+                 "lastReceive": now - app.ONLINE_WINDOW_MINUTES * 60_000 - 1}]},
+            {"address": "4444444444", "role": "PLANET", "paths": [fresh]},
+            {"address": "5555555555", "role": "LEAF", "paths": [
+                {"active": True, "expired": False, "lastReceive": 0, "lastSend": now}]},
+            {"address": "6666666666", "role": "LEAF", "paths": [
+                {"active": True, "expired": False, "lastReceive": now + 30_000}]},
+            {"address": "7777777777", "role": "LEAF", "paths": [
+                {"active": False, "expired": True, "lastReceive": now - 10_000},
+                {"active": True, "expired": False, "lastReceive": now - 1000}]},
+            {"address": "not-a-node", "role": "LEAF", "paths": [fresh]},
+            {"address": "8888888888", "role": "LEAF", "paths": None},
+            None,
+        ]
+        with patch.object(app, "controller_request", return_value=peers) as request:
+            active = app.active_peer_addresses(now_ms=now)
+        self.assertEqual(active, {"1111111111", "7777777777"})
+        request.assert_called_once_with("GET", "/peer")
+
+    def test_active_peers_reject_invalid_api_response(self):
+        with patch.object(app, "controller_request", return_value={}):
+            with self.assertRaises(app.ControllerError):
+                app.active_peer_addresses()
+
+    def test_online_member_count_intersects_room_members(self):
+        members = {"1111111111": 1, "2222222222": 2, "3333333333": 3}
+        with patch.object(app, "controller_request", return_value=members):
+            self.assertEqual(
+                app.online_member_count("7375be7d6e000001", {"1111111111", "3333333333", "9999999999"}), 2)
+
+    def test_online_member_count_accepts_list_shape_and_deduplicates(self):
+        members = ["1111111111", {"address": "1111111111"}, {"address": "2222222222"}, None]
+        with patch.object(app, "controller_request", return_value=members):
+            self.assertEqual(
+                app.online_member_count("7375be7d6e000001", {"1111111111", "9999999999"}), 1)
+
+    def test_online_member_count_rejects_bad_member_response(self):
+        with patch.object(app, "controller_request", return_value=None):
+            with self.assertRaises(app.ControllerError):
+                app.online_member_count("7375be7d6e000001", set())
+
+    def test_room_presence_is_scoped_to_registered_members(self):
+        networks = [
+            {"id": "7375be7d6e000001", "name": "game-room:AOE", "creationTime": 12},
+            {"id": "7375be7d6e000002", "name": "game-room:HL", "creationTime": 13},
+        ]
+        records = {
+            "/controller/network/7375be7d6e000001/member": {"1111111111": 1, "2222222222": 1},
+            "/controller/network/7375be7d6e000002/member": {"2222222222": 1, "3333333333": 1},
+        }
+        with patch.object(app, "controller_networks", return_value=networks), \
+             patch.object(app, "active_peer_addresses", return_value={"1111111111", "3333333333"}) as peers, \
+             patch.object(app, "controller_request", side_effect=lambda _method, url: records[url]):
+            result = {room["name"]: room["online"] for room in app.list_rooms()}
+        self.assertEqual(result, {"AOE": 1, "HL": 1})
+        peers.assert_called_once()
 
     def test_create_room_public_broadcast_and_route(self):
         observed = []
@@ -114,6 +186,8 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertIn("nonce-", headers["Content-Security-Policy"])
         self.assertNotIn(b"zerotier-token", data)
+        self.assertIn(b"Online", data)
+        self.assertNotIn(b"__WINDOW_MINUTES__", data)
 
     def test_healthz_and_head(self):
         code, _, data = self.request("HEAD", "/")
@@ -122,10 +196,10 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(json.loads(data)["ok"], True)
 
     def test_list_rooms_api(self):
-        with patch.object(app, "list_rooms", return_value=[{"id": "7375be7d6eabcdef", "name": "HL", "members": 2}]):
+        with patch.object(app, "list_rooms", return_value=[{"id": "7375be7d6eabcdef", "name": "HL", "online": 2}]):
             code, _, data = self.request("GET", "/api/rooms")
         self.assertEqual(code, 200)
-        self.assertEqual(json.loads(data)["rooms"][0]["members"], 2)
+        self.assertEqual(json.loads(data)["rooms"][0]["online"], 2)
 
     def test_post_rejects_cross_origin_and_non_json(self):
         code, _, data = self.request("POST", "/api/rooms", "name=bad", {"Content-Type": "application/x-www-form-urlencoded"})
@@ -136,7 +210,7 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(code, 403)
 
     def test_post_returns_created_network(self):
-        with patch.object(app, "create_room", return_value={"id": "7375be7d6e000001", "name": "AOE", "members": 0}):
+        with patch.object(app, "create_room", return_value={"id": "7375be7d6e000001", "name": "AOE", "online": 0}):
             code, _, data = self.request("POST", "/api/rooms", b'{"name":"AOE"}', {"Content-Type": "application/json"})
         self.assertEqual(code, 201)
         self.assertEqual(json.loads(data)["room"]["name"], "AOE")
