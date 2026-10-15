@@ -1,14 +1,106 @@
 import http.client
 import json
+import os
 import sys
 import threading
 import unittest
+from tempfile import TemporaryDirectory
 from pathlib import Path
 from unittest.mock import patch
 from http.server import ThreadingHTTPServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app
+
+
+class ControllerCredentialsTests(unittest.TestCase):
+    def test_reads_controller_token_from_systemd_credential_env(self):
+        with TemporaryDirectory() as root:
+            Path(root, "controller-env").write_text(
+                '# Never log this secret\n'
+                'ZT_GAME_CONTROLLER_URL="https://zt-controller.example.com:9993"\n'
+                "ZT_GAME_CONTROLLER_TOKEN='example_token_123'\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": root}, clear=True):
+                self.assertEqual(
+                    app.controller_settings(),
+                    ("https://zt-controller.example.com:9993", "example_token_123"),
+                )
+
+    def test_legacy_systemd_authtoken_still_supported(self):
+        with TemporaryDirectory() as root:
+            Path(root, "zerotier-token").write_text("local_secret\n", encoding="utf-8")
+            with patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": root}, clear=True):
+                self.assertEqual(
+                    app.controller_settings(),
+                    ("http://127.0.0.1:9993", "local_secret"),
+                )
+
+    def test_explicit_env_file_is_usable_for_admin_purge(self):
+        with TemporaryDirectory() as root:
+            p = Path(root, "configured.env")
+            p.write_text("ZT_GAME_CONTROLLER_TOKEN=admin_token_123\n", encoding="utf-8")
+            with patch.dict(os.environ, {"ZT_GAME_CONTROLLER_ENV_FILE": str(p)}, clear=True):
+                self.assertEqual(
+                    app.controller_settings(),
+                    ("http://127.0.0.1:9993", "admin_token_123"),
+                )
+
+    def test_empty_env_token_does_not_fall_back_to_local_secret(self):
+        with TemporaryDirectory() as root:
+            Path(root, "controller-env").write_text("ZT_GAME_CONTROLLER_TOKEN=\n", encoding="utf-8")
+            Path(root, "zerotier-token").write_text("local_secret\n", encoding="utf-8")
+            with patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": root}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "ZT_GAME_CONTROLLER_TOKEN is empty"):
+                    app.controller_settings()
+
+    def test_bad_env_files_are_rejected(self):
+        cases = (
+            "ZT_GAME_CONTROLLER_TOKEN=x\nZT_GAME_CONTROLLER_TOKEN=y\n",
+            "export ZT_GAME_CONTROLLER_TOKEN=foo\n",
+            "SOME_OTHER_KEY=abc\n",
+            "ZT_GAME_CONTROLLER_TOKEN abc\n",
+        )
+        for content in cases:
+            with self.subTest(content=content), TemporaryDirectory() as root:
+                p = Path(root, "controller.env")
+                p.write_text(content, encoding="utf-8")
+                with patch.dict(os.environ, {"ZT_GAME_CONTROLLER_ENV_FILE": str(p)}, clear=True):
+                    with self.assertRaises(RuntimeError):
+                        app.controller_settings()
+
+    def test_remote_controller_requires_https_and_no_credentials_in_url(self):
+        urls = (
+            "http://192.0.2.1:9993",
+            "https://alice:secret@controller.example.org",
+            "https://controller.example.org/other/path",
+            "ftp://controller.example.org",
+            "https://controller.example.org?test=1",
+        )
+        for url in urls:
+            with self.subTest(url=url), patch.dict(os.environ, {
+                    "ZT_GAME_CONTROLLER_URL": url, "ZT_GAME_CONTROLLER_TOKEN": "secret",
+                }, clear=True):
+                with self.assertRaises(RuntimeError):
+                    app.controller_settings()
+
+    def test_controller_request_uses_configured_url_and_token_header(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return False
+            def read(self):
+                return b'{"id":"sample"}'
+
+        with patch.object(app, "controller_settings",
+                          return_value=("https://controller.example.org:9993", "private_token")), \
+             patch.object(app, "urlopen", return_value=FakeResponse()) as opener:
+            self.assertEqual(app.controller_request("GET", "/controller/network"), {"id": "sample"})
+        request = opener.call_args.args[0]
+        self.assertEqual(request.full_url, "https://controller.example.org:9993/controller/network")
+        self.assertEqual(request.get_header("X-zt1-auth"), "private_token")
 
 
 class RoomTests(unittest.TestCase):
@@ -188,6 +280,11 @@ class HttpTests(unittest.TestCase):
         self.assertNotIn(b"zerotier-token", data)
         self.assertIn(b"Online", data)
         self.assertNotIn(b"__WINDOW_MINUTES__", data)
+        self.assertIn(b"https://www.zerotier.com/download/", data)
+        self.assertIn(b"id=\"join-guide\"", data)
+        self.assertIn(b"sudo zerotier-cli join NETWORK_ID", data)
+        self.assertIn(b"join-id", data)
+        self.assertIn(b"id=\"join-command\"", data)
 
     def test_healthz_and_head(self):
         code, _, data = self.request("HEAD", "/")
