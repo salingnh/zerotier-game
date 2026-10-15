@@ -31,7 +31,7 @@ WireGuard vpn.salingnh.com / UDP 51820: không thay đổi
 ZeroTier P2P / UDP 9993: không thay đổi
 ```
 
-**ZeroTier Controller** có thể chạy trên cùng VM (mặc định `http://127.0.0.1:9993`) hoặc trên máy khác qua API HTTPS. Portal không tự cài hoặc cấu hình lại ZeroTier One.
+**ZeroTier Controller** có thể chạy trên cùng VM (mặc định `http://127.0.0.1:9993`) hoặc trên máy khác qua API HTTPS. Portal không tự cài hoặc cấu hình lại ZeroTier One. Sơ đồ là cấu hình controller nội bộ mặc định; khi dùng controller từ xa, thay tuyến API bằng URL HTTPS đã đặt trong `.env`.
 
 ## Yêu cầu
 
@@ -138,15 +138,15 @@ sudo bash install.sh
 Room, trạng thái controller và Caddy cũ vẫn được giữ. Nếu đang chạy bản không có `.env`, fallback sang token nội bộ vẫn hoạt động. Muốn chuyển sang .env, làm bước 2 rồi cài lại. Source `.env` không được tự động xóa hoặc đưa vào Git.
 
 
-## Hướng dẫn sử dụng
+## Vận hành và kiểm tra Web UI
 
-1. Vào `https://zero.salingnh.com`, đăng nhập ở Caddy.
-2. Nhập tên phòng, nhấn **Tạo phòng**.
-3. Copy **Network ID** và gửi cho người chơi.
-4. Người chơi cài [ZeroTier One](https://www.zerotier.com/download/), chọn **Join New Network**, dán ID.
-5. Client tự nhận IP thuộc `10.230.x.0/24` của phòng. Game LAN có thể nhìn thấy nhau qua broadcast, phụ thuộc từng trò chơi và Windows Firewall.
+Sau khi triển khai, quản trị viên mở `https://zero.salingnh.com` qua lớp xác thực Caddy, tạo thử một phòng và xác nhận Network ID được cấp tự động. Khi dùng API, kiểm tra `GET /api/rooms` để xác nhận quyền truy cập controller và danh sách mạng.
 
-**Có hướng dẫn ngay trên web:** nhấn **Cách join** trên phòng cần vào để mở mục **Hướng dẫn cài đặt ZeroTier và tham gia phòng**, tự chèn Network ID và lệnh Linux `sudo zerotier-cli join <Network ID>` tương ứng. Giao diện có link tải ZeroTier chính thức, các bước Windows/macOS/Android/iOS, lệnh Linux và cách kiểm tra trạng thái `OK`. Phòng public nên không cần quản trị viên authorize thiết bị.
+**Phân tách tài liệu:**
+- **README này dành cho quản trị viên triển khai Web UI:** tải source, đặt controller URL/key vào `.env`, cài service systemd, xác thực qua Caddy, nâng cấp và xử lý lỗi.
+- **Hướng dẫn cài ZeroTier Client và join room dành cho người chơi nằm ngay trên Web UI:** nhấn **Cách join** cạnh phòng mong muốn. Web UI tự điền đúng Network ID và lệnh join Linux; nội dung bao gồm link tải client chính thức, hướng dẫn Windows/macOS/Android/iOS/Linux và cách kiểm tra kết nối.
+
+Website không thể tự cài ZeroTier Client hoặc tự join thay người chơi. Chỉ cung cấp Network ID cho người muốn tham gia; tuyệt đối không gửi controller API key cho người chơi.
 
 Danh sách hiển thị **Room ID/Network ID**, tên và **số node online (ước tính)**. Portal gọi `/peer` **một lần mỗi lần làm mới**, chỉ tính `LEAF` có path đang hoạt động và `lastReceive` trong cửa sổ thời gian gần đây, rồi đối chiếu Node ID với danh sách member của từng phòng. Giao diện tự cập nhật mỗi **10 giây**.
 
