@@ -4,6 +4,7 @@ Web UI **siêu nhẹ** để tạo và xem phòng chơi game ZeroTier trên cont
 
 - **Không** Docker, Node.js, pip/venv, database, Redis, frontend build hay dịch vụ reverse proxy mới.
 - Một file ứng dụng `app.py` (Python standard library), chạy bằng systemd.
+- Hiển thị **online (ước tính)**: đối chiếu member từng phòng với các peer có lưu lượng nhận gần đây qua ZeroTier local API `/peer` (mặc định 5 phút).
 - Chỉ lắng nghe tại **`127.0.0.1:9394`**, giữ nguyên cấu hình Caddy đang `reverse_proxy 127.0.0.1:9394`.
 - Không gửi ZeroTier `authtoken.secret` xuống trình duyệt: systemd đọc trực tiếp từ file secret gốc bằng `LoadCredential=`.
 - Tự động chọn mạng từ `10.230.1.0/24` đến `10.230.254.0/24`, tránh trùng những routes/pools trên controller.
@@ -101,7 +102,9 @@ Nếu Caddy vẫn còn chỉ thị `header_up X-ZT1-AUTH` của zerotier-edge c�
 4. Người chơi cài [ZeroTier One](https://www.zerotier.com/download/), chọn **Join New Network**, dán ID.
 5. Client tự nhận IP thuộc `10.230.x.0/24` của phòng. Game LAN có thể nhìn thấy nhau qua broadcast, phụ thuộc từng trò chơi và Windows Firewall.
 
-Danh sách hiển thị **Room ID/Network ID**, tên và **số node đã join được controller ghi nhận**. Số này **không phải số người đang online theo thời gian thực**; một node rời mạng có thể vẫn còn record.
+Danh sách hiển thị **Room ID/Network ID**, tên và **số node online (ước tính)**. Portal gọi `/peer` **một lần mỗi lần làm mới**, chỉ tính `LEAF` có path đang hoạt động và `lastReceive` trong cửa sổ thời gian gần đây, rồi đối chiếu Node ID với danh sách member của từng phòng. Giao diện tự cập nhật mỗi **10 giây**.
+
+**Giới hạn:** `/peer` là trạng thái peer của **node controller trên toàn bộ ZeroTier**, không cung cấp presence riêng cho từng mạng. Thiết bị online ở mạng khác nhưng đã join phòng có thể được tính vào phòng; ngược lại, thiết bị đang trao đổi P2P nhưng lâu không liên lạc controller có thể không được tính. Đây là số **ước tính**, không khẳng định người chơi đang mở game, cũng không xóa member khi offline.
 
 Mạng game **không có default route**, vì vậy không giành vai trò Internet Exit Node với WireGuard hiện có.
 
@@ -110,7 +113,7 @@ Mạng game **không có default route**, vì vậy không giành vai trò Inter
 | API | Ý nghĩa |
 |---|---|
 | `GET /healthz` | Kiểm tra HTTP service |
-| `GET /api/rooms` | Liệt kê các mạng có tiền tố `game-room:` |
+| `GET /api/rooms` | Liệt kê các mạng có tiền tố `game-room:`, kèm `online` (ước tính) |
 | `POST /api/rooms` | Tạo phòng: JSON `{"name":"AOE tối nay"}` |
 
 Ví dụ từ chính VM (API chưa có xác thực riêng, không chạy lệnh này từ Internet nếu chưa qua Caddy auth):
@@ -123,6 +126,8 @@ curl -fsS http://127.0.0.1:9394/api/rooms \
 ```
 
 **Mặc định giới hạn** 64 phòng và 10 lượt tạo phòng/giờ trên toàn ứng dụng (bộ đếm lượt tạo lưu RAM và reset khi service restart). Không có tự xóa phòng theo thời gian trong V1; nên có quy trình dọn phòng khi cần.
+
+`ZT_GAME_ONLINE_WINDOW_MINUTES=5` (cho phép 1–60 phút) điều chỉnh khoảng thời gian tính **online ước tính**. Trường `online` trong JSON `GET /api/rooms` và `POST /api/rooms` thay cho trường `members` cũ; giá trị mới không phải tổng số thiết bị từng join. Trên máy đã cài bản cũ, có thể tự thêm dòng này vào `/etc/default/zerotier-game` hoặc giữ mặc định 5 phút.
 
 Chỉnh giới hạn tại `/etc/default/zerotier-game`, sau đó:
 
@@ -167,6 +172,7 @@ sudo ss -ltnp | grep -E ':(9394|9993)\b'
 - **Trang `zero.salingnh.com` trả 502:** kiểm tra `zerotier-game` active và Caddy có `reverse_proxy 127.0.0.1:9394`.
 - **Caddy không khởi động:** kiểm tra Caddyfile và các drop-in EnvironmentFile cũ của zerotier-edge (đặc biệt nếu đã xóa `/etc/caddy/zerotier-edge.env`). Portal mới không cần cấu hình chèn controller token vào Caddy.
 - **Không tạo được phòng:** `curl http://127.0.0.1:9394/api/rooms`, kiểm tra token ZeroTier gốc và `zerotier-one`.
+- **Số online luôn 0 hoặc không đúng:** xem `sudo zerotier-cli -j peers` (hoặc `sudo zerotier-cli peers`) trên máy controller. Nếu peer không có `lastReceive` gần đây thì portal không thể xác định online, dù các thiết bị vẫn có thể đang kết nối P2P.
 - **Không thấy LAN game:** kiểm tra Windows Firewall, virtual adapter, broadcast; ZeroTier Layer 2 tạo điều kiện LAN discovery nhưng không cam kết tương thích 100% với mọi bản game.
 
 ## Kiểm thử phát triển (không phải cài lên VM)
