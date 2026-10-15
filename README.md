@@ -146,7 +146,7 @@ Room, trạng thái controller và Caddy cũ vẫn được giữ. Nếu đang c
 4. Người chơi cài [ZeroTier One](https://www.zerotier.com/download/), chọn **Join New Network**, dán ID.
 5. Client tự nhận IP thuộc `10.230.x.0/24` của phòng. Game LAN có thể nhìn thấy nhau qua broadcast, phụ thuộc từng trò chơi và Windows Firewall.
 
-**Có hướng dẫn ngay trên web:** nhấn **Cách join** trên phòng cần vào để mở mục **Hướng dẫn cài đặt ZeroTier và tham gia phòng**, tự chèn Network ID đang chọn. Giao diện có link tải ZeroTier chính thức, các bước Windows/macOS/Android/iOS, lệnh Linux và cách kiểm tra trạng thái `OK`. Phòng public nên không cần quản trị viên authorize thiết bị.
+**Có hướng dẫn ngay trên web:** nhấn **Cách join** trên phòng cần vào để mở mục **Hướng dẫn cài đặt ZeroTier và tham gia phòng**, tự chèn Network ID và lệnh Linux `sudo zerotier-cli join <Network ID>` tương ứng. Giao diện có link tải ZeroTier chính thức, các bước Windows/macOS/Android/iOS, lệnh Linux và cách kiểm tra trạng thái `OK`. Phòng public nên không cần quản trị viên authorize thiết bị.
 
 Danh sách hiển thị **Room ID/Network ID**, tên và **số node online (ước tính)**. Portal gọi `/peer` **một lần mỗi lần làm mới**, chỉ tính `LEAF` có path đang hoạt động và `lastReceive` trong cửa sổ thời gian gần đây, rồi đối chiếu Node ID với danh sách member của từng phòng. Giao diện tự cập nhật mỗi **10 giây**.
 
