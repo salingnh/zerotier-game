@@ -7,7 +7,10 @@ APP_NAME="zerotier-game"
 APP_DIR="/opt/${APP_NAME}"
 UNIT="/etc/systemd/system/${APP_NAME}.service"
 CONFIG="/etc/default/${APP_NAME}"
+SECRET_DIR="/etc/${APP_NAME}"
+SECRET_ENV="${SECRET_DIR}/controller.env"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_ENV="${SCRIPT_DIR}/.env"
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || fail "Run: sudo bash install.sh"
@@ -16,9 +19,28 @@ fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 for cmd in python3 systemctl install ss curl; do
     command -v "$cmd" >/dev/null || fail "Required command missing: $cmd"
 done
-command -v zerotier-cli >/dev/null || fail "Install ZeroTier One before this portal"
-[[ -s /var/lib/zerotier-one/authtoken.secret ]] || fail "ZeroTier token is missing"
-systemctl is-active --quiet zerotier-one || fail "zerotier-one service is not running"
+# A root-only .env copied into /etc/zerotier-game takes precedence over
+# legacy local ZeroTier authtoken.secret. The .env is passed to systemd using
+# LoadCredential, not EnvironmentFile: the controller key stays out of the
+# process environment, unit file, command-line arguments and systemctl show.
+[[ ! -L "$SECRET_DIR" && ! -L "$SECRET_ENV" ]] || fail "Refusing symlinked secret path"
+CREDENTIAL_MODE=local
+if [[ -f "$SECRET_ENV" ]]; then
+    [[ -s "$SECRET_ENV" ]] || fail "$SECRET_ENV is empty"
+    CREDENTIAL_MODE=env
+elif [[ -e "$SECRET_ENV" ]]; then
+    fail "$SECRET_ENV is not a regular file"
+elif [[ -f "$SOURCE_ENV" ]]; then
+    [[ ! -L "$SOURCE_ENV" ]] || fail "Refusing symlinked source .env"
+    [[ -s "$SOURCE_ENV" ]] || fail ".env is empty"
+    CREDENTIAL_MODE=env
+fi
+
+if [[ "$CREDENTIAL_MODE" == local ]]; then
+    command -v zerotier-cli >/dev/null || fail "Install ZeroTier One before this portal, or configure .env"
+    [[ -s /var/lib/zerotier-one/authtoken.secret ]] || fail "ZeroTier token is missing. Configure .env or install ZeroTier One"
+    systemctl is-active --quiet zerotier-one || fail "zerotier-one service is not running"
+fi
 
 # An old zerotier-edge may still be using 9394. Do not remove it implicitly.
 if systemctl is-active --quiet zerotier-edge.service 2>/dev/null; then
@@ -38,6 +60,21 @@ install -d -o root -g root -m 0755 "$APP_DIR"
 install -o root -g root -m 0644 "${SCRIPT_DIR}/app.py" "$APP_DIR/app.py"
 install -o root -g root -m 0755 "${SCRIPT_DIR}/uninstall.sh" "$APP_DIR/uninstall.sh"
 
+UNIT_DEPENDENCIES=""
+if [[ "$CREDENTIAL_MODE" == env ]]; then
+    install -d -o root -g root -m 0700 "$SECRET_DIR"
+    # Preserve an installed key on upgrades. For rotation, edit installed file.
+    if [[ ! -e "$SECRET_ENV" ]]; then
+        install -o root -g root -m 0600 "$SOURCE_ENV" "$SECRET_ENV"
+    fi
+    chown root:root "$SECRET_ENV"
+    chmod 0600 "$SECRET_ENV"
+    CREDENTIAL_LINE="LoadCredential=controller-env:$SECRET_ENV"
+else
+    CREDENTIAL_LINE="LoadCredential=zerotier-token:/var/lib/zerotier-one/authtoken.secret"
+    UNIT_DEPENDENCIES=$'After=zerotier-one.service\nRequires=zerotier-one.service'
+fi
+
 if [[ ! -f "$CONFIG" ]]; then
     cat > "$CONFIG" <<'EOF'
 # Local-only. Caddy can continue proxying to 127.0.0.1:9394.
@@ -49,18 +86,19 @@ EOF
     chmod 0644 "$CONFIG"
 fi
 
-cat > "$UNIT" <<'EOF'
+cat > "$UNIT" <<EOF
 [Unit]
 Description=ZeroTier Game Room Portal (localhost only)
-After=network-online.target zerotier-one.service
-Requires=zerotier-one.service
+Wants=network-online.target
+After=network-online.target
+$UNIT_DEPENDENCIES
 
 [Service]
 Type=simple
 DynamicUser=yes
 Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=-/etc/default/zerotier-game
-LoadCredential=zerotier-token:/var/lib/zerotier-one/authtoken.secret
+$CREDENTIAL_LINE
 ExecStart=/usr/bin/python3 -B /opt/zerotier-game/app.py
 Restart=on-failure
 RestartSec=3
@@ -96,7 +134,13 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 if [[ "$ready" != 1 ]]; then
     systemctl --no-pager --full status "$APP_NAME.service" || true
-    fail "Service did not pass health check. Inspect: journalctl -u ${APP_NAME} -n 50"
+    fail "Service did not pass health check. Inspect: journalctl -u $APP_NAME -n 50"
+fi
+
+# healthz is HTTP-only. Also verify controller token, TLS and access.
+if ! curl --noproxy '*' -fsS --max-time 20 \
+    http://127.0.0.1:9394/api/rooms >/dev/null; then
+    fail "Controller API authentication/connectivity failed. Check $SECRET_ENV or local token and journalctl -u $APP_NAME"
 fi
 
 cat <<'EOF'
@@ -105,6 +149,7 @@ Installation successful.
   Check:     curl http://127.0.0.1:9394/api/rooms
   Service:   systemctl status zerotier-game
   Existing Caddy reverse_proxy 127.0.0.1:9394: unchanged
+  Controller credential: protected root-only .env or local token
 
 SECURITY: The application has NO built-in user authentication.
 Before exposing it via zero.salingnh.com, enforce Caddy Basic Auth
